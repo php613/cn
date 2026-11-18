@@ -1,0 +1,205 @@
+name: Knesset VOD to Google Drive Sync
+
+on:
+  schedule:
+    # רץ מדי יום ב-03:00 UTC (05:00/06:00 שעון ישראל)
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      hours_back:
+        description: 'טווח חיפוש אחורה בשעות'
+        required: false
+        default: '48'
+        type: string
+      max_workers:
+        description: 'מקסימום Runners מקביליים במטריצה'
+        required: false
+        default: '4'
+        type: string
+      internal_concurrency:
+        description: 'הזרמות מקבילות בתוך כל Runner (זהירות עם RAM)'
+        required: false
+        default: '2'
+        type: string
+      dry_run:
+        description: 'בדיקה בלבד ללא הורדה והעלאה לדרייב'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # מונע הרצה חופפת שעלולה ליצור כפילויות העלאה בדרייב
+  group: knesset-vod-sync
+  cancel-in-progress: false
+
+env:
+  UV_SYSTEM_PYTHON: '0'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  # =========================================================================
+  # שלב 1: גילוי שידורים חדשים (48 שעות) + סינון מול Google Drive + חלוקה לאצוות
+  # =========================================================================
+  discover:
+    name: Discover New VODs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      has_items: ${{ steps.run_discover.outputs.has_items }}
+      matrix_workers: ${{ steps.run_discover.outputs.matrix_workers }}
+      total_found: ${{ steps.run_discover.outputs.total_found }}
+      total_new: ${{ steps.run_discover.outputs.total_new }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup uv & Python cache
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen --no-dev
+
+      - name: Run discovery & deduplication
+        id: run_discover
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          HOURS_BACK: ${{ inputs.hours_back || '48' }}
+          MAX_WORKERS: ${{ inputs.max_workers || '4' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          mkdir -p artifacts/batches
+          uv run python -m src.discover \
+            --hours-back "$HOURS_BACK" \
+            --max-workers "$MAX_WORKERS" \
+            --output-dir artifacts/batches \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload batches manifest artifact
+        if: steps.run_discover.outputs.has_items == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: knesset-batches
+          path: artifacts/batches/
+          retention-days: 1
+
+  # =========================================================================
+  # שלב 2: הזרמה מקבילית דרך RAM (0GB דיסק) -> Google Drive Resumable Upload
+  # =========================================================================
+  upload_workers:
+    name: Upload Worker #${{ matrix.worker_id }}
+    needs: discover
+    if: needs.discover.outputs.has_items == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_id: ${{ fromJson(needs.discover.outputs.matrix_workers) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify ffmpeg is available
+        run: ffmpeg -version | head -n 2
+
+      - name: Setup uv & Python cache
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen --no-dev
+
+      - name: Download batches manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: knesset-batches
+          path: artifacts/batches
+
+      - name: Stream & upload batch ${{ matrix.worker_id }}
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          WORKER_ID: ${{ matrix.worker_id }}
+          INTERNAL_CONCURRENCY: ${{ inputs.internal_concurrency || '2' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          mkdir -p artifacts/results
+          uv run python -m src.worker \
+            --batch-file "artifacts/batches/batch_${WORKER_ID}.json" \
+            --result-file "artifacts/results/result_${WORKER_ID}.json" \
+            --concurrency "$INTERNAL_CONCURRENCY"
+
+      - name: Upload worker log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-result-${{ matrix.worker_id }}
+          path: artifacts/results/result_${{ matrix.worker_id }}.json
+          if-no-files-found: warn
+          retention-days: 3
+
+  # =========================================================================
+  # שלב 3: איחוד לוגים ודוח סיכום מרכזי ללא התנגשויות כתיבה
+  # =========================================================================
+  consolidate:
+    name: Consolidate Logs & Summary
+    needs: [discover, upload_workers]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup uv & Python cache
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen --no-dev
+
+      - name: Download all worker results
+        if: needs.discover.outputs.has_items == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: worker-result-*
+          path: artifacts/results
+          merge-multiple: true
+
+      - name: Consolidate report & publish summary
+        env:
+          HAS_ITEMS: ${{ needs.discover.outputs.has_items }}
+          TOTAL_FOUND: ${{ needs.discover.outputs.total_found || '0' }}
+          TOTAL_NEW: ${{ needs.discover.outputs.total_new || '0' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          mkdir -p artifacts/results artifacts/final
+          uv run python -m src.consolidate \
+            --results-dir artifacts/results \
+            --output-log artifacts/final/sync_report.json \
+            --summary-file "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload consolidated log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: consolidated-sync-report
+          path: artifacts/final/sync_report.json
+          retention-days: 14
